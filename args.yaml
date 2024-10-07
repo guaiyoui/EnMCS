@@ -1,0 +1,168 @@
+DEFAULT: &DEFAULT
+  black_list: [1,2,0]
+  method: grid
+  metric:
+    name: loss
+    goal: minimize
+
+DMG: &DMG
+  model_name: DMG
+#  common_name: RetainU_NoLinkLoss_NoLossCon
+  common_name: test_split_batch
+#  common_name: RetainU_NoLinkLoss_NegLossCon  # if use_gdc, auto suffix '_gdc'
+  # alpha: 1
+  # beta: 1
+  alpha: 0.8
+  beta: 0.4
+  gamma: 0
+  tau: 0.5
+  gdc_dt: 0.1  # graph diffusion degree threshold
+  use_gdc: False
+  gdc_k_pattern: 'eqN'  # topk == num_nodes
+#  gdc_ppr_alp: 0.15
+  gt: 2  # diffusion heat kernel t
+  big_dataset: ['higgs']
+  use_pretrain: False
+  pretrain_model_path: './checkpoint/higgs_Node_test_split_batch_loss_7.7277445793151855.pt'
+  <<: *DEFAULT
+
+
+# 过去的系数分配
+#args.nei_coef * NodeNeighborLoss + args.alpha * link_loss + match_err
+#args.beta * corr + args.lammbda * loss_contra
+
+# original
+#DMG-acm-Node: &DMG-acm-Node
+#  <<: *DMG
+##  num_iters: 1
+#  num_iters: 100
+#  decolayer: 3
+##  alpha: 0.02
+#  beta: 0.8
+#  lammbda: 3
+#  tau: 0.5
+
+
+#DMG-imdb-Node: &DMG-imdb-Node
+#  <<: *DMG
+#  num_iters: 70
+#  hid_units: 512
+##  alpha: 0.06
+#  beta: 1
+##  lammbda: 0.5
+#  lammbda: -0.5
+#  tau: 0.5
+
+# no loss_con
+DMG-imdb-Node: &DMG-imdb-Node
+  <<: *DMG
+  num_iters: 70
+  hid_units: 512
+#  batch_size: 4000
+  batch_size: 4780
+#  alpha: 0.06
+#  beta: 1
+#  lammbda: 0
+#  tau: 0.5
+
+# 参数等同 imdb
+DMG-acm-Node: &DMG-acm-Node
+  <<: *DMG-imdb-Node
+  batch_size: 3025
+#  <<: *DMG
+##  num_iters: 1
+#  num_iters: 70
+#  decolayer: 3
+##  alpha: 0.02
+#  beta: 1
+#  lammbda: 0.5
+#  tau: 0.5
+
+DMG-freebase-Node: &DMG-freebase-Node
+  <<: *DMG-imdb-Node
+  batch_size: 3492
+#  <<: *DMG
+#  num_iters: 200
+##  alpha: 0.6
+#  beta: 0.8
+#  lammbda: 0.5
+#  sample_neighbor: 50
+#  tau: 0.7
+
+DMG-dblp-Node: &DMG-dblp-Node
+  <<: *DMG-imdb-Node
+  batch_size: 4057
+#  <<: *DMG
+#  feature_drop: 0.1
+#  num_iters: 400
+##  alpha: 0.1
+#  beta: 0.05
+#  lammbda: 0.05
+#  tau: 0.7
+#  test_epo: 300
+#  test_lr: 0.05
+
+
+DMG-terrorist-Node: &DMG-terrorist-Node
+  <<: *DMG-imdb-Node
+  batch_size: 79
+#  <<: *DMG
+#  num_iters: 70
+#  hid_units: 512
+##  alpha: 0.06
+#  beta: 1
+#  lammbda: 0.5
+#  tau: 0.5
+
+DMG-rm-Node: &DMG-rm-Node
+  <<: *DMG-imdb-Node
+  batch_size: 91
+# DMG-RM-Node: &DMG-RM-Node
+#   <<: *DMG-imdb-Node
+#   batch_size: 91
+#  batch_size: 40
+#  <<: *DMG
+#  num_iters: 70
+#  hid_units: 512
+##  alpha: 0.06
+#  beta: 1
+#  lammbda: 0.5
+#  tau: 0.5
+
+
+DMG-3sources-Node: &DMG-3sources-Node
+  <<: *DMG-imdb-Node
+
+DMG-WikipediaArticles-Node: &DMG-WikipediaArticles-Node
+  <<: *DMG-imdb-Node
+
+DMG-BBC4view_685-Node: &DMG-BBC4view_685-Node
+  <<: *DMG-imdb-Node
+
+DMG-BBCSport2view_544-Node: &DMG-BBCSport2view_544-Node
+  <<: *DMG-imdb-Node
+
+DMG-aucs-Node: &DMG-aucs-Node
+  <<: *DMG-imdb-Node
+
+DMG-citeseer-Node: &DMG-citeseer-Node
+  <<: *DMG-imdb-Node
+
+DMG-UCI_mfeat-Node: &DMG-UCI_mfeat-Node
+  <<: *DMG-imdb-Node
+
+DMG-UCI_mfeat2-Node: &DMG-UCI_mfeat2-Node
+  <<: *DMG-imdb-Node
+
+DMG-webKB_texas_2-Node: &DMG-webKB_texas_2-Node
+  <<: *DMG-imdb-Node
+
+DMG-cora-Node: &DMG-cora-Node
+  <<: *DMG-imdb-Node
+
+DMG-knn_10-Node: &DMG-knn_10-Node
+  <<: *DMG-imdb-Node
+
+DMG-higgs-Node: &DMG-higgs-Node
+  <<: *DMG-imdb-Node
+  batch_size: 3000

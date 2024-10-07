@@ -1,0 +1,1 @@
+./pretrain_result/WikipediaArticles/test_split_batch/

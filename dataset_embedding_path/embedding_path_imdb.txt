@@ -1,0 +1,1 @@
+./pretrain_result/imdb/test_split_batch/

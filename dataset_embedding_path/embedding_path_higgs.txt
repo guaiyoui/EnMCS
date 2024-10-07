@@ -1,0 +1,1 @@
+./pretrain_result/higgs/test_split_batch/

@@ -1,0 +1,1 @@
+./pretrain_result/freebase/test_split_batch/

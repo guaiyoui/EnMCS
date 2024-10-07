@@ -1,0 +1,1 @@
+./pretrain_result/aucs/test_split_batch/

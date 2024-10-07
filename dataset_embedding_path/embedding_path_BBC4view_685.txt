@@ -1,0 +1,1 @@
+./pretrain_result/BBC4view_685/test_split_batch/

@@ -1,0 +1,638 @@
+import argparse
+import torch
+import scipy.sparse as sp
+from dgl import DGLGraph
+from sklearn.model_selection import ShuffleSplit
+from tqdm import tqdm
+import dgl
+from sklearn.metrics import f1_score
+import scipy.sparse as sp
+import numpy as np
+import networkx as nx
+from numpy import *
+from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score, jaccard_score
+import torch.nn.functional as F
+import time
+import torch.nn as nn
+
+# Training settings
+def parse_args():
+    """
+    Generate a parameters parser.
+    """
+    # parse parameters
+    parser = argparse.ArgumentParser()
+
+    # main parameters
+    parser.add_argument('--name', type=str, default=None)
+    parser.add_argument('--dataset', type=str, default='cora',
+                        help='Choose from {pubmed}')
+    parser.add_argument('--model_name', type = str, default = 'cora',
+                        help = 'The name for the model to save')
+    parser.add_argument('--device', type=int, default=0,
+                        help='Device cuda id')
+    parser.add_argument('--seed', type=int, default=0, 
+                        help='Random seed.')
+
+    # model parameters
+    parser.add_argument('--hops', type=int, default=2,
+                        help='Hop of neighbors to be calculated')
+    # parser.add_argument('--pe_dim', type=int, default=15,
+    parser.add_argument('--pe_dim', type=int, default=5,
+                        help='position embedding size')
+    parser.add_argument('--hidden_dim', type=int, default=512,
+                        help='Hidden layer size')
+    parser.add_argument('--ffn_dim', type=int, default=64,
+                        help='FFN layer size')
+    parser.add_argument('--n_layers', type=int, default=1,
+                        help='Number of Transformer layers')
+    parser.add_argument('--n_heads', type=int, default=8,
+                        help='Number of Transformer heads')
+    parser.add_argument('--dropout', type=float, default=0.1,
+                        help='Dropout')
+    parser.add_argument('--attention_dropout', type=float, default=0.1,
+                        help='Dropout in the attention layer')
+    parser.add_argument('--readout', type=str, default="mean")
+    parser.add_argument('--alpha', type=float, default=0.1, 
+                        help='the value the balance the loss.')
+
+    # training parameters
+    parser.add_argument('--batch_size', type=int, default=1000,
+                        help='Batch size')
+    parser.add_argument('--group_epoch_gap', type=int, default=20,
+                        help='Batch size')
+    parser.add_argument('--epochs', type=int, default=100,
+                        help='Number of epochs to train.')
+    parser.add_argument('--tot_updates',  type=int, default=1000,
+                        help='used for optimizer learning rate scheduling')
+    parser.add_argument('--warmup_updates', type=int, default=400,
+                        help='warmup steps')
+    parser.add_argument('--peak_lr', type=float, default=0.001, 
+                        help='learning rate')
+    parser.add_argument('--end_lr', type=float, default=0.0001, 
+                        help='learning rate')
+    parser.add_argument('--weight_decay', type=float, default=0.00001,
+                        help='weight decay')
+    parser.add_argument('--patience', type=int, default=50, 
+                        help='Patience for early stopping')
+    
+    # model saving
+    parser.add_argument('--save_path', type=str, default='./model/',
+                        help='The path for the model to save')
+    parser.add_argument('--embedding_path', type=str, default='./pretrain_result/',
+                        help='The path for the embedding to save')
+
+    return parser.parse_args()
+
+
+def laplacian_positional_encoding(g, pos_enc_dim):
+    """
+        Graph positional encoding v/ Laplacian eigenvectors
+    """
+
+    # Laplacian
+
+    #adjacency_matrix(transpose, scipy_fmt="csr")
+    # A = g.adjacency_matrix_scipy(return_edge_ids=False).astype(float)
+    A = g.adj_external(scipy_fmt='csr')
+    N = sp.diags(dgl.backend.asnumpy(g.in_degrees()).clip(1) ** -0.5, dtype=float)
+    L = sp.eye(g.number_of_nodes()) - N * A * N
+
+    # Eigenvectors with scipy
+    #EigVal, EigVec = sp.linalg.eigs(L, k=pos_enc_dim+1, which='SR')
+    EigVal, EigVec = sp.linalg.eigs(L, k=pos_enc_dim+1, which='SR', tol=1e-2) # for 40 PEs
+    EigVec = EigVec[:, EigVal.argsort()] # increasing order
+    lap_pos_enc = torch.from_numpy(EigVec[:,1:pos_enc_dim+1]).float() 
+
+    return lap_pos_enc
+
+
+
+def re_features(adj, features, K):
+    nodes_features = torch.empty(features.shape[0], 1, K+1, features.shape[1])
+    # ***
+    # ***
+    for i in range(features.shape[0]):
+
+        nodes_features[i, 0, 0, :] = features[i]
+
+    x = features + torch.zeros_like(features)
+    # (((x == features).sum(axis = 0)) == 2708).sum()
+    for i in range(K):
+
+        x = torch.matmul(adj, x)
+
+        for index in range(features.shape[0]):
+
+            nodes_features[index, 0, i + 1, :] = x[index]        
+
+    nodes_features = nodes_features.squeeze()
+
+
+    return nodes_features
+
+def conductance_hop(adj, max_khop):
+    adj = adj.to(dtype=torch.float)
+    # adj = adj.to(torch.device('cuda'))
+    adj_current_hop = adj
+
+    results = torch.zeros((max_khop+1, adj.shape[0]))
+    for hop in range(max_khop+1):
+        adj_current_hop = torch.matmul(adj_current_hop, adj)
+        degree = torch.sum(adj_current_hop, dim=0)
+        adj_current_hop_sign = torch.sign(adj_current_hop)
+        degree_1 = torch.sum(adj_current_hop_sign, dim=0) 
+        results[hop] = (degree-degree_1).to_dense().reshape(1, -1)  # ?
+        hop += 1
+    results = results.T
+    max_indices = torch.argmax(results, dim=1)
+    
+    for i in range(results.shape[0]):
+        for j in range(results.shape[1]):       
+            if j>max_indices[i] and max_indices[i] != 0:
+                results[i][j] = 0
+            else:
+                results[i][j] = 1
+    return results
+
+# def f1_score_calculation(y_pred, y_true):
+#     if len(y_pred.shape) == 1:
+#         y_pred = y_pred.reshape(1, -1)
+#         y_true = y_true.reshape(1, -1)
+#     F1 = []
+#     for i in range(y_pred.shape[0]):
+#         pre = torch.sum(torch.multiply(y_pred[i], y_true[i]))/(torch.sum(y_pred[i])+1E-9)
+#         rec = torch.sum(torch.multiply(y_pred[i], y_true[i]))/(torch.sum(y_true[i])+1E-9)
+#         F1.append(2 * pre * rec / (pre + rec+1E-9))
+#
+#     return mean(F1)
+
+def f1_score_calculation(y_pred, y_true):
+    y_pred = y_pred.reshape(1, -1)
+    y_true = y_true.reshape(1, -1)
+    pre = torch.sum(torch.multiply(y_pred, y_true))/(torch.sum(y_pred)+1E-9)
+    rec = torch.sum(torch.multiply(y_pred, y_true))/(torch.sum(y_true)+1E-9)
+    F1 = 2 * pre * rec / (pre + rec+1E-9)
+    print("recall: ", rec, "pre: ", pre)
+    return F1
+
+
+def evaluation(comm_find, comm):
+    
+    comm_find = comm_find.reshape(-1)
+    comm = comm.reshape(-1)
+    
+    return normalized_mutual_info_score(comm, comm_find), adjusted_rand_score(comm, comm_find), jaccard_score(comm, comm_find)
+
+# def evaluation(comm_find, comm):
+
+#     nmi_all, ari_all, jac_all = [], [], []
+
+#     for i in range(comm_find.shape[0]):
+#         nmi_all.append(NMI_score(comm_find[i], comm[i]))
+#         ari_all.append(ARI_score(comm_find[i], comm[i]))
+#         jac_all.append(JAC_score(comm_find[i], comm[i]))
+
+#     return np.mean(nmi_all), np.mean(ari_all), np.mean(jac_all) 
+
+def NMI_score(comm_find, comm):
+
+    score = normalized_mutual_info_score(comm, comm_find)
+    #print("q, nmi:", score)
+    return score
+
+def ARI_score(comm_find, comm):
+
+    score = adjusted_rand_score(comm, comm_find)
+    #print("q, ari:", score)
+
+    return score
+
+def JAC_score(comm_find, comm):
+
+    score = jaccard_score(comm, comm_find)
+    #print("q, jac:", score)
+    return score
+
+def load_query_n_gt(path, dataset, vec_length):
+    # load query and ground truth
+    query = []
+    file_query = open(path + dataset + '/' + dataset + ".query", 'r')
+    for line in file_query:
+        vec = [0 for i in range(vec_length)]
+        line = line.strip()
+        line = line.split(" ")
+        for i in line:
+            vec[int(i)] = 1
+        query.append(vec)
+
+    gt = []
+    file_gt = open(path + dataset + '/' + dataset + ".gt", 'r')
+    for line in file_gt:
+        vec = [0 for i in range(vec_length)]
+        line = line.strip()
+        line = line.split(" ")
+        
+        for i in line:
+            vec[int(i)] = 1
+        gt.append(vec)
+    
+    return torch.Tensor(query), torch.Tensor(gt)
+
+def get_gt_legnth(path, dataset):
+    gt_legnth = []
+    file_gt = open(path + dataset + '/' + dataset + ".gt", 'r')
+    for line in file_gt:
+        line = line.strip()
+        line = line.split(" ")
+        gt_legnth.append(len(line))
+    
+    return torch.Tensor(gt_legnth)
+
+def cosin_similarity(query_tensor, emb_tensor):
+    # similarity = torch.stack([torch.cosine_similarity(query_tensor[i], emb_tensor, dim=1) for i in range(len(query_tensor))], 0)
+    similarity = torch.stack([torch.cosine_similarity(query_tensor[i].reshape(1, -1), emb_tensor, dim=1) for i in range(len(query_tensor))], 0)
+    # print(similarity.shape)
+    return similarity
+    
+def dot_similarity(query_tensor, emb_tensor):
+    similarity = torch.mm(query_tensor, emb_tensor.t()) # (query_num, node_num)
+    similarity = torch.nn.Softmax(dim=1)(similarity)
+    return similarity
+
+
+def transform_coo_to_csr(adj):
+    row=adj._indices()[0]
+    col=adj._indices()[1]
+    data=adj._values()
+    shape=adj.size()
+    adj=sp.csr_matrix((data, (row, col)), shape=shape)
+    return adj
+
+def transform_csr_to_coo(adj, size=None):
+    # ****
+    # 测试
+    # adj = sp.csr_matrix(adj.cpu())
+    # ***
+    adj = adj.tocoo()
+    # adj = torch.sparse.LongTensor(torch.LongTensor([adj.row.tolist(), adj.col.tolist()]),
+    #                           torch.LongTensor(adj.data.astype(np.int32)),
+    #                           torch.Size([size, size]))
+    adj = torch.sparse.FloatTensor(torch.LongTensor([adj.row.tolist(), adj.col.tolist()]),
+                                  torch.FloatTensor(adj.data),
+                                  torch.Size([size, size]))
+    return adj
+
+def transform_sp_csr_to_coo(x, adj, batch_size, node_num, drop_last = False):
+    # chunks
+    node_index = [i for i in range(node_num)]
+    divide_index = [node_index[i:i+batch_size] for i in range(0, len(node_index), batch_size)]
+    if len(divide_index[-1]) < batch_size and drop_last:
+        divide_index = divide_index[: -1]
+
+    # adj of each chunks, in the format of sp_csr
+    # print("start mini batch: adj of each chunks")
+    # adj = adj.toarray()
+    adj_sp_csr = []
+    x_list = []
+    for i in range(len(divide_index)):
+        # mask = torch.isin()
+        if adj.layout == torch.sparse_coo:
+            temp = transform_coo_to_csr(adj.cpu())[divide_index[i]][:, divide_index[i]]
+        else:
+            temp = adj[divide_index[i]][:, divide_index[i]].cpu()
+        adj_sp_csr.append(temp)
+        x_list.append(x[divide_index[i]].cpu())
+    # adj_sp_csr = [adj[divide_index[i]][:, divide_index[i]] for i in range(len(divide_index))]
+    # adj_sp_csr = adj_sp_csr.to_sparse_csr()
+
+    # adj_tensor_coo = [transform_csr_to_coo(item).to_dense() for item in adj_sp_csr]
+    # minus_adj_tensor_coo = [transform_csr_to_coo(item).to_dense() for item in minus_adj_sp_csr]
+    # print("start mini batch: back to torch coo adj")
+    if isinstance(adj_sp_csr[0], sp._csr.csr_matrix):
+        adj_tensor_coo = [transform_csr_to_coo(adj_sp_csr[i], len(divide_index[i])).to_dense() for i in range(len(divide_index))]
+        return adj_tensor_coo, x_list
+    return adj_sp_csr, x_list
+    # return adj_sp_csr, x_list
+
+
+# transform coo to edge index in pytorch geometric 
+def transform_coo_to_edge_index(adj):
+    adj = adj.coalesce()
+    edge_index = adj.indices().detach().long()
+    return edge_index
+
+def sparse_mx_to_torch_sparse_tensor(sparse_mx):
+    """Convert a scipy sparse matrix to a torch sparse tensor."""
+    sparse_mx = sparse_mx.tocoo().astype(np.float32)
+    indices = torch.from_numpy(
+        np.vstack((sparse_mx.row, sparse_mx.col)).astype(np.int64))
+    values = torch.from_numpy(sparse_mx.data)
+    shape = torch.Size(sparse_mx.shape)
+    return torch.sparse.FloatTensor(indices, values, shape)
+
+def torch_adj_to_scipy(adj):
+
+    shape = adj.shape
+    coords = adj.coalesce().indices()
+    values = adj.coalesce().values()
+
+    scipy_sparse = sp.coo_matrix((values.cpu().numpy(), (coords[0].cpu().numpy(), coords[1].cpu().numpy())), shape=shape)
+
+    return scipy_sparse
+
+# determine one edge in edge_index or not of torch geometric
+def is_edge_in_edge_index(edge_index, source, target):
+    mask = (edge_index[0] == source) & (edge_index[1] == target)
+    return mask.any()
+
+def construct_pseudo_assignment(cluster_ids_x):
+    pseudo_assignment = torch.zeros(cluster_ids_x.shape[0], int(cluster_ids_x.max()+1))
+
+    for i in range(cluster_ids_x.shape[0]):
+        pseudo_assignment[i][int(cluster_ids_x[i])] = 1
+    
+    return pseudo_assignment
+
+def pq_computation(similarity):
+    q = torch.nn.functional.normalize(similarity, dim=1, p=1)
+    p_temp = torch.mul(q, q)
+    q_colsum = torch.sum(q, axis=0)
+    p_temp = torch.div(p_temp,q_colsum)
+    p = torch.nn.functional.normalize(p_temp, dim=1, p=1)
+    return q, p
+
+def coo_matrix_to_nx_graph(matrix):
+    # Create an empty NetworkX graph
+    graph = nx.Graph()
+
+    # Get the number of nodes in the COO matrix
+    num_nodes = matrix.shape[0]
+
+    # Convert the COO matrix to a dense matrix
+    dense_matrix = matrix.to_dense()
+
+    # Iterate over the non-zero entries in the dense matrix
+    for i in range(num_nodes):
+        for j in range(num_nodes):
+            if dense_matrix[i][j] != 0:
+                # Add an edge to the NetworkX graph
+                graph.add_edge(i, j)
+                graph.add_edge(j, i)
+
+    return graph
+
+def coo_matrix_to_nx_graph_efficient(adj_matrix, use_weight = False):
+    
+    graph = nx.Graph()
+
+    adj_matrix = adj_matrix.to_sparse_coo()
+    adj_matrix = adj_matrix.coalesce()
+    rows = adj_matrix.indices()[0]
+    cols = adj_matrix.indices()[1]
+    values = adj_matrix.values()
+
+    if use_weight:
+        for i in range(len(rows)):
+            graph.add_edge(int(rows[i]), int(cols[i]), weight = values[i].item())
+            graph.add_edge(int(cols[i]), int(rows[i]), weight = values[i].item())
+    else:
+        for i in range(len(rows)):
+            graph.add_edge(int(rows[i]), int(cols[i]))
+            graph.add_edge(int(cols[i]), int(rows[i]))
+
+    return graph
+
+def obtain_adj_from_nx(graph):
+    return np.array(nx.adjacency_matrix(graph, nodelist=[i for i in range(max(graph.nodes)+1)]).todense())
+
+def find_all_neighbors_bynx(query, Graph, threshold = 0):
+    
+    nodes = Graph.nodes()
+    # edge_weights = [item[2] for item in Graph.edges(data = 'weight')]
+    neighbors = []
+    for i in range(len(query)):
+        if query[i] not in nodes:
+            continue
+        # for item in Graph.edges(query[i], data = 'weight'):
+        #     # edge = sorted(edge, key = lambda x: x[2], reverse = True)
+        #     if item[1] not in query and item[2] >= threshold:
+        #         neighbors.append(item[1])
+        for j in Graph.neighbors(query[i]):
+            if j not in query:
+                neighbors.append(j)
+    return neighbors
+
+def MaxMinNormalization(x, Min, Max):
+    
+    x = np.array(x)
+    x_max = np.max(x)
+    x_min = np.min(x)
+
+    x = [(item-x_min)*(Max-Min)/(x_max - x_min) + Min for item in x]
+
+    return x
+
+def trainmultiplex(model, mea_func, U, features, adj_list, negation_adj, args,  optimizer, device, epoch):
+
+    model.train()
+    for i in range(args.num_view):
+        mea_func[i].train()
+
+    common, private, neighbor = model(features, adj_list)
+    # common, private, neighbor = model(features_copy, adj_list_copy)
+
+    # match_err, recons_err, recons_nei = loss_matching_recons(common, recons, features, U, idx_p_list, args, epoch)
+    NodeNeighborLoss, link_loss, match_err = loss_matching_recons(common, private, neighbor, features, U, args, epoch, adj_list, negation_adj)  
+    # Independence regularizer loss
+    phi_c_list = []
+    psi_p_list = []
+    for i in range(args.num_view):
+        phi_c, psi_p = mea_func[i](common[i], private[i])
+        phi_c_list.append(phi_c)
+        psi_p_list.append(psi_p)
+    corr = loss_independence(phi_c_list, psi_p_list)
+    if args.gamma:
+        loss_contra = loss_contrastive(U, private, adj_list, args)
+    else:
+        loss_contra = 0.0
+    
+
+    # loss = NodeNeighborLoss + args.alpha * match_err + args.beta * corr + args.gamma * loss_contra
+    loss = args.neighbor_coef*NodeNeighborLoss + args.alpha * match_err + args.beta * corr
+    
+
+    # Update all the parameters
+    optimizer.zero_grad()
+    start = time.time()
+    loss.backward()
+    end = time.time()
+    print('\nloss time', end - start)
+    optimizer.step()
+
+    # return loss, match_err, recons_err + recons_nei, corr, loss_con, common, private
+    # return loss, corr, loss_con, common, private
+    return loss
+
+
+# The loss function for matching and reconstruction
+# def loss_matching_recons(s, x_hat, x, U, idx_p_list, args, epoch):  # common, recons, features, U, idx_p_list, args, epoch
+def loss_matching_recons(common, private, neighbor, features, U, args, epoch, adj_list, negation_adj):  # common, recons, features, U, idx_p_list, args, epoch
+    l = torch.nn.MSELoss(reduction='sum')
+    marginLoss = nn.MarginRankingLoss(0.5)
+
+    # Common Matching loss
+    match_err = l(torch.cat(common, 1), U.repeat(1, args.num_view))/common[0].shape[0]
+
+    # Private Matching loss
+    contrastive_pair = []
+    # for i in range(args.num_view):
+    #     for j in range(i, args.num_view):
+    #         if i == j:
+    #             continue
+    #         contrastive_pair.append((i, j))
+    # pri_match_err = 0.0
+    # for tup in contrastive_pair:
+    #     pri_match_err += l(private[tup[0]], private[tup[1]]) / private[0].shape[0]
+
+    # personalization loss
+    NodeNeighborLoss = 0.0
+    # total_loss = match_err
+
+    def contrastive_loss(a, b, shuff_index, loss_function, pattern = 'forward'):
+        ones = torch.ones(common[0].shape[0]).to(args.device)
+        a_shuf = a[shuff_index]
+        b_shuf = b[shuff_index]
+        logits_aa = torch.sigmoid(torch.sum(a * b, dim = -1))
+        logits_bb = torch.sigmoid(torch.sum(a_shuf * b_shuf, dim = -1))
+        logits_ab = torch.sigmoid(torch.sum(a * b_shuf, dim = -1))
+        logits_ba = torch.sigmoid(torch.sum(a_shuf * b, dim = -1))
+        # return loss_function(logits_aa, logits_ba, ones) + loss_function(logits_bb, logits_ab, ones) + \
+        #     (logits_ba.sum() + logits_ab.sum()) / logits_ab.shape[0]
+        if pattern == 'forward':
+            return loss_function(logits_aa, logits_ba, ones) + loss_function(logits_bb, logits_ab, ones)
+        elif pattern == 'reverse':
+            return loss_function(logits_aa, logits_ba, ones * -1) + loss_function(logits_bb, logits_ab, ones * -1)
+        else:
+            print('unknown contrastive error pattern')
+            raise KeyError
+
+    shuf_index = torch.randperm(common[0].shape[0])
+    NodeNeighborLoss += contrastive_loss(U, neighbor[-1], shuf_index, marginLoss)
+
+    for i in range(len(common)):
+        NodeNeighborLoss += contrastive_loss(common[i], neighbor[i], shuf_index, marginLoss)
+
+    # private feature contrastive loss
+    for i in range(len(private)):
+        NodeNeighborLoss += contrastive_loss(private[i], neighbor[i], shuf_index, marginLoss, pattern = 'reverse')
+
+    # link loss
+    link_loss = 0.0
+    # measure link loss
+    # for i in range(args.num_view):
+    #     temp_negation_adj = negation_adj[i]
+    #     pairwise_similarity = torch.mm(private[i], private[i].T)
+    #     link_loss += temp_negation_adj.multiply(pairwise_similarity) - adj_list[i].multiply(pairwise_similarity)
+    # link_loss = torch.sum(link_loss) / (adj_list[0].shape[0] ** 2)
+
+
+    return NodeNeighborLoss, link_loss, match_err
+
+
+    UNeighborLoss = torch.sigmoid(torch.sum(U, ))
+    PNeighborLoss = 0.0
+    for i in range(args.num_view):
+        pass
+    TotalLoss = 0.0
+    ones = torch.ones(common[0].shape[0])
+    for i in range(args.num_view):
+        self_common_loss = torch.sigmoid(torch.sum(common[i], common[i], dim = -1))
+        inter_commont_loss = torch.zeros()
+        for j in range(args.num_view):
+            if j == i:
+                continue
+            inter_commont_loss = torch.sigmoid(torch.sum(common[i], common[j], dim = -1))
+
+
+
+    node_tensor_shuf = node_tensor[shuf_index]
+    neighbor_tensor_shuf = neighbor_tensor[shuf_index]
+
+    # recons_err = 0
+    # # Feature reconstruction loss
+    # for i in range(args.num_view):
+    #     recons_err += l(x_hat[i], x[i])
+    # recons_err /= common[0].shape[0]
+
+    # Topology reconstruction loss
+    # interval = int(args.neighbor_num/args.sample_neighbor)
+    # neighbor_embedding = []
+    # for i in range(args.num_view):
+    #     neighbor_embedding_0 = []
+    #     for j in range(0, args.sample_neighbor+1):  # ????
+    #         neighbor_embedding_0.append(x[i][idx_p_list[i][(epoch + interval * j) % args.neighbor_num]])
+    #     neighbor_embedding.append(sum(neighbor_embedding_0) / args.sample_neighbor)
+    # recons_nei = 0
+    # for i in range(args.num_view):
+    #     recons_nei += l(x_hat[i], neighbor_embedding[i])
+    # recons_nei /= common[0].shape[0]
+
+    return match_err, recons_err, recons_nei
+
+
+# The loss function for independence regularization
+def loss_independence(phi_c_list, psi_p_list):
+    # Correlation
+    corr = 0
+    for i in range(len(phi_c_list)):
+        corr += compute_corr(phi_c_list[i], psi_p_list[i])
+    return corr
+
+
+# cContrastive loss
+def loss_contrastive(U, private, adj_list, args):
+    i = 0
+    loss = 0
+    for i in range(args.num_view):
+        adj = adj_list[i]
+        out_node = adj.to_sparse()._indices()[1]
+        random = np.random.randint(out_node.shape[0],
+                                   size=max(int((out_node.shape[0] / args.sample_num_divisor)), args.min_sample_num))
+        sample_edge = adj.to_sparse()._indices().T[random]
+        dis = F.cosine_similarity(U[sample_edge.T[0]],U[sample_edge.T[1]])
+        a, maxidx = torch.sort(dis, descending=True)
+        idx1 = maxidx[:int(sample_edge.shape[0]*0.2)]
+        b, minidx = torch.sort(dis, descending=False)
+        idx2 = minidx[:int(sample_edge.shape[0]*0.1)]
+        private_sample_0 = private[i][sample_edge[idx1].T[0]]
+        private_sample_1 = private[i][sample_edge[idx1].T[1]]
+        private_sample_2 = private[i][sample_edge[idx2].T[0]]
+        private_sample_3 = private[i][sample_edge[idx2].T[1]]
+        i += 1
+        loss += semi_loss(private_sample_0, private_sample_1, private_sample_2, private_sample_3, args)
+    return loss
+
+
+def semi_loss(z1, z2, z3, z4, args):
+    f = lambda x: torch.exp(x / args.tau)
+    positive = f(F.cosine_similarity(z1, z2))
+    negative = f(F.cosine_similarity(z3, z4))
+    return -torch.log(
+        positive.sum()
+        / (positive.sum() + negative.sum() ))
+
+
+def compute_corr(x1, x2):
+    # Subtract the mean
+    x1_mean = torch.mean(x1, 0, True)
+    x1 = x1 - x1_mean
+    x2_mean = torch.mean(x2, 0, True)
+    x2 = x2 - x2_mean
+
+    # Compute the cross correlation
+    sigma1 = torch.sqrt(torch.mean(x1.pow(2)))
+    sigma2 = torch.sqrt(torch.mean(x2.pow(2)))
+    corr = torch.abs(torch.mean(x1*x2))/(sigma1*sigma2)
+
+    return corr

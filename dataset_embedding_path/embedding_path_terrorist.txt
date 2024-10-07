@@ -1,0 +1,1 @@
+./pretrain_result/terrorist/test_split_batch/
