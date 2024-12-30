@@ -1,5 +1,5 @@
 Code for the paper "Ensemble Disentangled Representations for Unsupervised
-Multilayer Community Search" which is submitted for reviewing in SIGMOD 2025.
+Multilayer Community Search" which is submitted for reviewing in VLDB 2025.
 
 
 ### Training && Search in HoloSearch and EMerge
